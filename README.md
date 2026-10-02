@@ -15,8 +15,8 @@
 │   命中 → 拒绝 rule_matched（403），并向信誉系统登记一次 rule_matched 违规     │
 │ 维度 2 信誉隔离 ReputationManager.is_blocked                                 │
 │   隔离中 → 拒绝 quarantined（403），隔离期一律拒绝、不消耗限流额度           │
-│ 维度 3 滑动窗口 SlidingWindowRateLimiter.check（原子：判定+登记）            │
-│   超限 → 拒绝 rate_limited（429）；通过 → 放行 200                           │
+│ 维度 3 分档滑动窗口 SlidingWindowRateLimiter.check（原子：判定+登记）        │
+│   额度随信誉等级分档；超限 → 拒绝 rate_limited（429）；通过 → 放行 200       │
 └──────────────────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -50,13 +50,37 @@ Decision(allowed, reason, detail, rule_id, snapshot)
 | `block-admin` | `/admin` | 后台路径探测 |
 | `block-env` | `/.env` | 敏感文件探测 |
 
-## 3. 速率模型（`gateway/rate_limiter.py`）
+## 3. 速率模型（`gateway/rate_limiter.py` + 引擎分档）
 
-- 基于身份的滑动窗口：每个 `client_id` 一个时间戳列表，默认 `10 次 / 1s`。
+- 基于身份的滑动窗口：每个 `client_id` 一个时间戳列表，窗口默认 `1s`。
 - `check()` 在同一把锁内完成「淘汰过期 → 比较阈值 → 追加登记」，
   并发请求计数**不丢失、不重复**（1000 并发 / 阈值 500 的测试严格验证）。
 - 边界确定：窗口采用左开（边界时间戳过期），第 `limit` 次请求放行、第 `limit+1` 次拒绝。
-- 窗口过期后时间戳被淘汰，额度自动恢复；不同身份计数完全隔离。
+- 窗口过期后时间戳被淘汰，额度自动恢复；不同身份计数完全隔离；
+  窗口清空后身份条目即删除，身份表不随运行时间无限膨胀。
+
+### 3.1 按信誉等级分档的额度
+
+限流额度不再是所有身份一套死阈值，而是跟着实时信誉等级走：
+**信誉越差，允许的速率越低**；隔离身份在限流之前已被整体拒绝，不占任何额度。
+
+| 信誉等级 | 默认额度（`limit=10` 时） | 说明 |
+|---|---|---|
+| `normal` | 10（= `limit`，与旧行为一致） | 正常身份不受影响 |
+| `suspect` | 5（`limit/2`） | 1 次违规后下一请求即生效 |
+| `restricted` | 2（`limit/4`，至少 1） | 观察期内收紧 |
+| `quarantined` | —（整体拒绝，不消耗额度） | 同旧行为 |
+
+- 配置入口：`build_engine(..., level_limits={ReputationLevel.SUSPECT: 3, ...})`
+  或直接给 `DefenseEngine` 传 `level_limits`。未配置的等级回退到 `limit`；
+  `DefenseEngine` 缺省（None）时所有等级共用 `limit`，与旧行为完全一致。
+- 默认分档由 `gateway/service.py: default_level_limits()` 给出：
+  `normal=limit`、`suspect=max(1, limit//2)`、`restricted=max(1, limit//4)`。
+- **等级一变，下一次请求立即按新额度判定**（每次判定都实时取等级）。
+- 每次判定的响应快照里可见本次所用档位与剩余额度：
+  `snapshot.rate_limit = {tier_level, limit, used, remaining, ...}`。
+- 对老行为的影响：**normal 身份额度与之前完全一致**；只有产生了违规记录
+  （suspect/restricted）的身份会被收紧，这正是本特性的目的。
 
 ## 4. 信誉、隔离与恢复模型（`gateway/reputation.py`）
 
@@ -93,20 +117,55 @@ quarantined ──到期──▶ restricted ──5s 无违规──▶ suspect
 - 观察期内再次违规：连续计数继续累加，立即重新隔离，且 `quarantine_count` 增加、
   隔离时长翻倍。
 
-### 4.4 持久化与可追溯
+### 4.4 表现良好加速恢复（恢复进度）
+
+- 每完成一个无违规恢复步，`recovery_progress + 1`；进度达到
+  `good_accel_steps`（默认 **2**，`ReputationManager` / `build_engine` 可配）
+  时**立即跳回 `normal`**（跳级兑现，进度归零），事件记为 `accelerated_recover`。
+  例：`good_accel_steps=1` 时，隔离到期后第一个干净步就直接回 `normal`，跳过 `suspect`。
+- 默认阈值 2 下恢复节奏与旧阶梯完全一致（restricted→suspect→normal 各一步）。
+- **再违规即回退**：进度清零（违规事件带 `recovery_progress_cleared` 字段），
+  连续违规计数累加，该重新隔离就重新隔离。
+- 进度随状态 JSON 一起持久化，且状态迁移即落盘：进程重启后**不白攒**
+  （进度还在）、**不重攒**（同一恢复步不会重复累计）；并发查询下由同一把锁
+  保证每个恢复步只累计一次（均有测试覆盖）。
+
+### 4.5 状态回收与保留边界
+
+长时间运行不会让状态无限膨胀：
+
+- **闲置归档**：等级为 `normal` 且超过 `gc_idle_seconds`（默认 **3600s**）未出现的
+  身份被归档——只保留影响后续结论的最小信息（`quarantine_count`、`last_seen`），
+  其余字段压缩、该身份的事件流水清除。
+- **绝不回收**：隔离中、观察恢复期（`restricted`/`suspect`）、最近有活动的身份。
+  回收前会先按当前时间推进状态机，确保判定基于最新状态。
+- **结论可复现**：归档身份再次出现时原地复活；由于 `quarantine_count` 保留，
+  再次隔离的退避时长与从未回收完全一致（不会退化成“从没见过”的首次隔离）。
+  归档状态同样落盘，重启后结论不变。
+- **事件保留边界**：每个身份的事件流水最多保留 `max_events_per_client`
+  （默认 **100**）条，超出丢弃最旧。
+- **触发方式**：`ReputationManager.gc(now)` 可显式调用；请求路径上也会按
+  `gc_interval_seconds`（默认 **60s**）自动触发。`build_engine` 透传
+  `gc_idle_seconds` / `max_events_per_client` / `good_accel_steps`。
+- 回收不影响已成立的判定结论：等级、隔离退避次数、恢复进度语义均保持不变。
+
+### 4.6 持久化与可追溯
 
 - 状态与事件流水以 JSON 原子写入 `data/reputation.json`（临时文件 + `os.replace`）。
-- 进程重启后 `load()` 完整复现等级、隔离截止时间、隔离次数（有重启复现测试）。
-- 每次变更（`violation / escalate / quarantined / quarantine_released / recover`）
-  都追加一条事件，形成审计轨迹，可通过 `ReputationManager.events(client_id)` 查询。
+- 进程重启后 `load()` 完整复现等级、隔离截止时间、隔离次数、恢复进度与归档标记
+  （有重启复现测试）。
+- 每次变更（`violation / escalate / quarantined / quarantine_released / recover /
+  accelerated_recover / gc`）都追加一条事件，形成审计轨迹，可通过
+  `ReputationManager.events(client_id)` 查询。
 
 ## 5. 可解释性与日志
 
 - 每次判定都通过 `logging` 打印：客户端、路径、原因（ALLOW/DENY）、规则 ID、
   以及包含限流窗口与信誉状态的**状态快照**。
 - `Decision.snapshot`（以及 HTTP 响应体中的 `snapshot` 字段）包含：
-  - `rate_limit`：阈值、窗口、已用、剩余、窗口内时间戳；
-  - `reputation`：等级、连续违规数、隔离次数、隔离截止与剩余时间。
+  - `rate_limit`：本次档位（`tier_level`）、该档阈值、窗口、已用、剩余、窗口内时间戳；
+  - `reputation`：等级、连续违规数、隔离次数、隔离截止与剩余时间、
+    恢复进度（`recovery_progress`）、是否已归档（`archived`）。
 
 ## 6. 运行与验证
 
@@ -131,13 +190,25 @@ for i in $(seq 1 12); do
 done
 ```
 
-运行测试（含并发、阈值边界、隔离恢复、重启复现、正常流量不误伤；
-日志中会打印判定依据与状态快照）：
+运行测试（含并发、阈值边界、隔离恢复、加速恢复、回收边界、重启复现、
+正常流量不误伤；日志中会打印每条用例的场景结论与关键状态快照）：
 
 ```bash
-uv run pytest -q                      # 静默概要
-uv run pytest -o log_cli=true         # 查看每条用例的判定依据与快照
-uv run pytest tests/test_engine.py    # 仅编排层测试
+uv run pytest -q                                  # 静默概要
+uv run pytest -o log_cli=true -o log_level=INFO   # 查看每条用例的场景、结论与状态快照
+uv run pytest tests/test_engine.py                # 仅编排层测试
+uv run pytest tests/test_tiered_rate_limit.py tests/test_recovery_progress.py tests/test_gc.py
+```
+
+本地手工验证新能力（默认装配：normal=10/s、suspect=5/s、restricted=2/s）：
+
+```bash
+# 分档限流：先违规 1 次（403 rule_matched），再连续打正常路径，
+# 第 6 次起 429，且响应 snapshot.rate_limit.tier_level == "suspect"、limit == 5
+curl -s -H 'X-Client-Id: tiered' http://127.0.0.1:8000/gateway/admin > /dev/null
+for i in $(seq 1 7); do
+  curl -s -H 'X-Client-Id: tiered' http://127.0.0.1:8000/gateway/home | jq -c '.snapshot.rate_limit | {tier_level, limit, remaining}'
+done
 ```
 
 ### 测试覆盖一览
@@ -147,6 +218,9 @@ uv run pytest tests/test_engine.py    # 仅编排层测试
 | `tests/test_rules.py` | 规则命中/不命中、方法限定、重复 rule_id |
 | `tests/test_rate_limiter.py` | 阈值边界、窗口恢复、并发精确计数、身份隔离 |
 | `tests/test_reputation.py` | 逐级升级、隔离拒绝、到期逐级恢复、观察期再犯加倍、重启复现、事件追溯 |
+| `tests/test_tiered_rate_limit.py` | 分档默认值（normal 不变）、等级变化即时生效、分档阈值边界、隔离不占额度、并发分档精确计数、快照可见档位 |
+| `tests/test_recovery_progress.py` | 加速恢复跳级、默认节奏与旧行为一致、再违规清零回退并重新隔离、进度重启复现（不白攒/不重攒）、并发只累计一次 |
+| `tests/test_gc.py` | 闲置归档、隔离/观察期/活跃身份不回收、归档后结论重启复现、归档身份复活、事件保留边界、自动回收触发 |
 | `tests/test_engine.py` | 三维度联合判定、原因可区分、正常流量不误伤、隔离不占限流额度、200 并发不变量 |
 | `tests/test_http.py` | 200/403/429 状态码与 `X-Deny-Reason` 头、响应内快照 |
 
@@ -156,10 +230,10 @@ uv run pytest tests/test_engine.py    # 仅编排层测试
 gateway/
   models.py         # RequestContext / Rule / Decision / 原因与等级枚举
   rules.py          # 维度一：规则匹配
-  reputation.py     # 维度二：信誉累积、隔离、退避恢复、JSON 持久化
-  rate_limiter.py   # 维度三：线程安全滑动窗口
-  engine.py         # 三维度编排与判定日志
-  service.py        # 默认规则/阈值/状态路径的装配
+  reputation.py     # 维度二：信誉累积、隔离、退避恢复、加速恢复进度、闲置归档、JSON 持久化
+  rate_limiter.py   # 维度三：线程安全滑动窗口（支持按次分档额度）
+  engine.py         # 三维度编排、按等级分档限流、判定日志
+  service.py        # 默认规则/分档阈值/恢复与回收参数的装配
 main.py             # FastAPI 入口（create_app 工厂，多入口共用同一引擎）
 tests/              # 全部单元与集成测试
 data/reputation.json# 运行期信誉状态（已 gitignore）
