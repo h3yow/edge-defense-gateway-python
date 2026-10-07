@@ -39,6 +39,8 @@ def build_engine(
     good_accel_steps: int = 2,
     gc_idle_seconds: float = 3600.0,
     max_events_per_client: int = 100,
+    gc_archive_seconds: float = 7 * 24 * 3600.0,
+    gc_archive_max_entries: int = 10000,
 ) -> DefenseEngine:
     rule_engine = RuleEngine(list(DEFAULT_RULES if rules is None else rules))
     reputation = ReputationManager(
@@ -46,6 +48,8 @@ def build_engine(
         good_accel_steps=good_accel_steps,
         gc_idle_seconds=gc_idle_seconds,
         max_events_per_client=max_events_per_client,
+        gc_archive_seconds=gc_archive_seconds,
+        gc_archive_max_entries=gc_archive_max_entries,
     )
     reputation.load()
     limiter = SlidingWindowRateLimiter(limit=limit, window_seconds=window_seconds)

@@ -116,6 +116,9 @@ class DefenseEngine:
                 snapshot=snap,
             )
 
+        # 放行 = 表现良好：观察期身份累计恢复进度（加速恢复的唯一计入口，
+        # 读路径不累计，同一次请求不会被重复计数）
+        self.reputation.record_good(ctx.client_id, now)
         snap = self._snapshot(ctx, now, tier)
         logger.info(
             "ALLOW client=%s path=%s tier=%s level=%s snapshot=%s",

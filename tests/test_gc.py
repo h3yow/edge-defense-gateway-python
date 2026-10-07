@@ -1,10 +1,12 @@
-"""状态回收与保留边界：闲置归档、保护隔离/观察期身份、结论可复现。
+"""状态回收与保留边界：闲置真回收、保护隔离/观察期身份、结论可复现、规模有界。
 
 覆盖场景：
-- 闲置 NORMAL 身份被归档；隔离中、观察恢复期、最近活动的身份绝不回收；
+- 闲置 NORMAL 身份被真正移出活动状态表；隔离中、观察恢复期、最近活动的身份绝不回收；
 - 恢复完成后又长期闲置的身份最终会被回收（状态不无限膨胀）；
-- 归档不丢结论：quarantine_count 保留，重启后再次隔离时长与回收前一致；
-- 归档身份再次出现原地复活，判定结论不变；
+- 大批量一次性身份下，活动状态表与归档记录规模都有界（不随见过的身份数增长）；
+- 回收不丢结论：quarantine_count 进入归档表并落盘，重启后再次隔离时长与回收前一致；
+- 归档记录本身有界：超过保留期彻底过期、超过条数上限淘汰最旧；
+- 被回收身份再次出现原地复活，判定结论不变；
 - 事件流水按边界保留（超出丢弃最旧）；
 - 请求路径上的自动回收按间隔触发。
 """
@@ -142,3 +144,82 @@ def test_auto_gc_triggered_on_request_path(tmp_path):
     gc_events = [e for e in mgr.events() if e["event"] == "gc"]
     logging.info("auto gc events=%s", gc_events)
     assert gc_events and "idle-one" in gc_events[-1]["reclaimed"]
+
+
+def test_state_table_shrinks_and_stays_bounded(tmp_path):
+    """场景：5 波×200 个一次性身份，波间周期回收。
+    结论：活动状态表被真正清空（不是只打标记），归档记录也封顶，
+    身份规模不随见过的身份总数（1000）无限增长。"""
+    mgr = _mgr(
+        tmp_path,
+        gc_idle_seconds=5.0,
+        gc_archive_seconds=100.0,
+        gc_archive_max_entries=50,
+    )
+    seen_total = 0
+    for wave in range(5):
+        base = wave * 1000.0
+        for i in range(200):
+            mgr.get_level(f"one-off-{wave}-{i}", base + i * 0.01)
+        seen_total += 200
+        before = mgr.gc(base + 2.0)["states"]   # 波内回收前：200 个活动状态
+        stats = mgr.gc(base + 500.0)            # 波后回收：全部闲置 -> 真删除
+        logging.info(
+            "wave=%d before_gc_states=%d after=%s", wave, before, stats,
+        )
+        assert before == 200
+        assert stats["states"] == 0             # 活动状态表真正收缩
+        assert stats["archived"] <= 50          # 归档记录封顶
+    final = mgr.gc(5 * 1000.0 + 500.0)
+    logging.info(
+        "final=%s seen_total=%d in_memory=%d",
+        final, seen_total, final["states"] + final["archived"],
+    )
+    assert seen_total == 1000
+    assert final["states"] == 0
+    assert final["archived"] <= 50  # 见过 1000 个身份，内存里最多留 50 条结论
+
+
+def test_archive_record_expires_after_archive_seconds(tmp_path):
+    """场景：有前科的身份被回收后长期不再出现，超过归档保留期。
+    结论：归档记录彻底过期删除；日后再犯按“第一次见”处理（保留期内
+    结论一致、超期后才允许退化，规模因此有界）。"""
+    mgr = _mgr(tmp_path, gc_idle_seconds=5.0, gc_archive_seconds=100.0)
+    for t in (0.0, 1.0, 2.0):
+        mgr.record_violation("c9", "rule", t)       # 第 1 次隔离，count=1
+    mgr.get_level("c9", 13.0)
+    mgr.get_level("c9", 18.0)
+    mgr.get_level("c9", 23.0)                       # -> NORMAL
+    stats = mgr.gc(50.0)                            # 回收 -> 归档（archived_at=50）
+    assert stats["reclaimed"] == ["c9"] and stats["archived"] == 1
+
+    stats = mgr.gc(200.0)                           # 200-50=150 >= 100 -> 过期
+    logging.info("archive expiry stats=%s", stats)
+    assert "c9" in stats["archive_expired"]
+    assert stats["archived"] == 0
+
+    # 归档已过期：再犯按第一次见，首次隔离 10s（对照保留期内应为 20s）
+    for t in (300.0, 301.0, 302.0):
+        mgr.record_violation("c9", "rule", t)
+    snap = mgr.snapshot("c9", 302.0)
+    logging.info("post-expiry snapshot=%s", snap)
+    assert snap["quarantine_count"] == 1
+    assert snap["quarantined_until"] == 312.0
+
+
+def test_archive_bounded_by_max_entries_evicts_oldest(tmp_path):
+    """场景：归档条数超过上限。结论：最旧的归档记录被淘汰，规模封顶。"""
+    mgr = _mgr(
+        tmp_path,
+        gc_idle_seconds=5.0,
+        gc_archive_seconds=10**9,   # 关闭时间过期，只验证条数上限
+        gc_archive_max_entries=3,
+    )
+    for i in range(5):
+        mgr.get_level(f"c{i}", 0.0)                 # 5 个一次性身份
+    stats = mgr.gc(100.0)
+    logging.info("archive cap stats=%s remaining=%s",
+                 stats, sorted(mgr._archive))
+    assert len(stats["reclaimed"]) == 5
+    assert stats["archived"] == 3                   # 封顶
+    assert set(mgr._archive) == {"c2", "c3", "c4"}  # 最旧的 c0/c1 被淘汰
