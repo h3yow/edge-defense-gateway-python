@@ -99,6 +99,7 @@ class DefenseEngine:
             )
 
         # 维度 3：按信誉等级分档的滑动窗口限流（原子判定 + 登记）
+        # 本次请求始终按进入时的等级取档；良好行为引发的恢复从下一次请求起生效。
         tier = self._tier_limit(level)
         if not self.limiter.check(ctx.client_id, now, limit=tier):
             snap = self._snapshot(ctx, now, tier)
@@ -116,9 +117,15 @@ class DefenseEngine:
                 snapshot=snap,
             )
 
+        # 被放行的“良好请求”：观察恢复期内累计良好信用，攒满可提前完成恢复步
+        # （只有真正放行的请求计良好；规则命中/隔离/限流拒绝均不计）。
+        # 信用引发的等级变化在下一次请求的分档与判定中生效。
+        new_level = self.reputation.note_good_request(ctx.client_id, now)
         snap = self._snapshot(ctx, now, tier)
+        snap["rate_limit"]["tier_level"] = level.value
+        snap["good_behavior_level_after"] = new_level.value
         logger.info(
-            "ALLOW client=%s path=%s tier=%s level=%s snapshot=%s",
-            ctx.client_id, ctx.path, tier, level.value, snap,
+            "ALLOW client=%s path=%s tier=%s level=%s level_after=%s snapshot=%s",
+            ctx.client_id, ctx.path, tier, level.value, new_level.value, snap,
         )
         return Decision(allowed=True, detail="放行", snapshot=snap)

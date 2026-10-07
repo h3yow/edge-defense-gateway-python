@@ -37,15 +37,23 @@ def build_engine(
     clock=time.monotonic,
     level_limits: dict[ReputationLevel, int] | None = None,
     good_accel_steps: int = 2,
+    good_requests_per_step: int = 3,
     gc_idle_seconds: float = 3600.0,
+    gc_history_ttl_seconds: float = 7 * 24 * 3600.0,
     max_events_per_client: int = 100,
+    max_gc_events: int = 100,
+    gc_interval_seconds: float = 60.0,
 ) -> DefenseEngine:
     rule_engine = RuleEngine(list(DEFAULT_RULES if rules is None else rules))
     reputation = ReputationManager(
         state_path=state_path,
         good_accel_steps=good_accel_steps,
+        good_requests_per_step=good_requests_per_step,
         gc_idle_seconds=gc_idle_seconds,
+        gc_history_ttl_seconds=gc_history_ttl_seconds,
         max_events_per_client=max_events_per_client,
+        max_gc_events=max_gc_events,
+        gc_interval_seconds=gc_interval_seconds,
     )
     reputation.load()
     limiter = SlidingWindowRateLimiter(limit=limit, window_seconds=window_seconds)
